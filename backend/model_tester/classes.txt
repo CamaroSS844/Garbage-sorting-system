@@ -1,0 +1,4 @@
+plastic
+paper
+plastic-bottle
+metal

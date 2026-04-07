@@ -1,0 +1,7 @@
+{
+  "name": "EcoSort Dashboard",
+  "description": "A comprehensive monitoring and management dashboard for the Automatic Trash Sorting System, featuring real-time camera feeds, device health tracking, and inference review.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

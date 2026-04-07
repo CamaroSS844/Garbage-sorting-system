@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+inference-sdk
+python-multipart
+onnxruntime
