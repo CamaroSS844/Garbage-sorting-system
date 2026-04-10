@@ -13,6 +13,8 @@ import time
 import math
 from collections import OrderedDict
 import queue
+import sqlite3
+import aiosqlite
 
 # --- Inference libraries ---
 import torch
@@ -22,7 +24,7 @@ from ultralytics import YOLO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from inference_sdk import InferenceHTTPClient
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 # ------------------------------
 # Config
@@ -37,6 +39,8 @@ UPLOAD_DIR = Path("./uploads")
 FAILED_DIR = Path("./failed")
 UPLOAD_DIR.mkdir(exist_ok=True)
 FAILED_DIR.mkdir(exist_ok=True)
+
+DB_PATH = Path("./ecosort.db")
 
 HEARTBEAT_TIMEOUT = timedelta(seconds=10)
 CONTROL_DEADMAN_TIMEOUT = timedelta(milliseconds=5000)
@@ -55,6 +59,40 @@ TRACKING_ENABLED = False
 TRACKER_MAX_DISAPPEARED = 30
 TRACKER_MAX_DISTANCE = 50
 
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
+
+# How often (in seconds) to flush an aggregated stats snapshot to DB.
+# Keeps DB writes infrequent so they don't affect inference latency.
+STATS_FLUSH_INTERVAL = 30  # seconds
+
+TRIGGER_ZONES = [
+    {
+        "id": "zone_a",
+        "label": "Zone A",
+        "actuator_id": "actuator_1",
+        "x_position": 180,
+        "color": "#10b981",
+        "cooldown_frames": 45,
+    },
+    {
+        "id": "zone_b",
+        "label": "Zone B",
+        "actuator_id": "actuator_2",
+        "x_position": 350,
+        "color": "#3b82f6",
+        "cooldown_frames": 45,
+    },
+    {
+        "id": "zone_c",
+        "label": "Zone C",
+        "actuator_id": "actuator_3",
+        "x_position": 520,
+        "color": "#f59e0b",
+        "cooldown_frames": 45,
+    },
+]
+
 # ------------------------------
 # App Init
 # ------------------------------
@@ -69,26 +107,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------
-# FIX 1: Use a thread-safe queue for frames (queue.Queue),
-# but use asyncio.Queue for results so the broadcast loop
-# never needs to touch threading primitives from async context.
-# ------------------------------
-
-# Thread-safe: written by capture thread, read by inference thread
 capture_queue: queue.Queue = queue.Queue(maxsize=1)
+result_queue_async: asyncio.Queue = None
 
-# Async-safe: written by inference thread via run_coroutine_threadsafe,
-# read by broadcast_loop coroutine with await
-result_queue_async: asyncio.Queue = None  # initialized in startup_event
-
-# Pipeline control
 capture_thread: Optional[threading.Thread] = None
 inference_thread: Optional[threading.Thread] = None
 pipeline_running = False
 
-# Stored reference to the main event loop so threads can post to it
 main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+# ------------------------------
+# In-memory stats accumulator
+# (written by inference thread, flushed to DB periodically by async task)
+# ------------------------------
+
+class StatsAccumulator:
+    """
+    Thread-safe counters incremented during inference.
+    Periodically snapshotted and written to DB without blocking inference.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_processed: int = 0
+        self.total_failures: int = 0
+
+    def record_detection(self, count: int = 1):
+        with self._lock:
+            self.total_processed += count
+
+    def record_failure(self, count: int = 1):
+        with self._lock:
+            self.total_failures += count
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "total_processed": self.total_processed,
+                "total_failures": self.total_failures,
+            }
+
+
+stats_accumulator = StatsAccumulator()
 
 # ------------------------------
 # Data Classes
@@ -96,7 +155,7 @@ main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 @dataclass
 class Detection:
-    bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2 (pixels)
+    bbox: Tuple[int, int, int, int]
     confidence: float
     class_id: int
     class_name: str
@@ -104,6 +163,214 @@ class Detection:
 @dataclass
 class TrackedObject(Detection):
     track_id: int = -1
+
+# ------------------------------
+# Database helpers
+# ------------------------------
+
+async def init_db():
+    """Create tables and seed demo failed_inference rows if empty."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS inference_logs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       REAL    NOT NULL,
+                class_name      TEXT,
+                confidence      REAL,
+                zone_id         TEXT,
+                actuator_id     TEXT,
+                is_failure      INTEGER DEFAULT 0,
+                image_path      TEXT,
+                device_id       TEXT,
+                inference_time_ms REAL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS failed_inferences (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp           REAL    NOT NULL,
+                image_path          TEXT,
+                device_id           TEXT,
+                confidence          REAL,
+                original_guess      TEXT,
+                assigned_category   TEXT,
+                reviewed            INTEGER DEFAULT 0,
+                notes               TEXT
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS system_stats (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        REAL    NOT NULL,
+                total_processed  INTEGER DEFAULT 0,
+                total_failures   INTEGER DEFAULT 0,
+                online_devices   INTEGER DEFAULT 0,
+                accuracy_rate    REAL    DEFAULT 0.0
+            )
+        """)
+
+        await db.commit()
+
+        # Seed 3 demo failed inference rows only if table is empty
+        cursor = await db.execute("SELECT COUNT(*) FROM failed_inferences")
+        row = await cursor.fetchone()
+        if row[0] == 0:
+            demo_rows = [
+                (
+                    time.time() - 3600,          # 1 hour ago
+                    None,                         # image_path
+                    "esp32-node-01",              # device_id
+                    0.21,                         # confidence
+                    "Plastic",                    # original_guess
+                    None,                         # assigned_category (not reviewed yet)
+                    0,                            # reviewed
+                    "Low confidence on conveyor belt edge",  # notes
+                ),
+                (
+                    time.time() - 1800,
+                    None,
+                    "esp32-node-02",
+                    0.18,
+                    "Metal",
+                    None,
+                    0,
+                    "Blurry frame during high-speed pass",
+                ),
+                (
+                    time.time() - 600,
+                    None,
+                    "esp32-node-01",
+                    0.09,
+                    "Glass",
+                    None,
+                    0,
+                    "Occlusion — item partially behind belt guide",
+                ),
+            ]
+            await db.executemany(
+                """INSERT INTO failed_inferences
+                   (timestamp, image_path, device_id, confidence,
+                    original_guess, assigned_category, reviewed, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                demo_rows,
+            )
+            await db.commit()
+            print("[db] Seeded 3 demo failed inference rows")
+
+
+async def log_zone_event(event: Dict[str, Any], inference_time_ms: float = 0.0):
+    """Write a single zone-fire detection to inference_logs (non-blocking)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO inference_logs
+               (timestamp, class_name, confidence, zone_id, actuator_id,
+                is_failure, image_path, device_id, inference_time_ms)
+               VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?)""",
+            (
+                event.get("timestamp", time.time()),
+                event.get("class_name"),
+                None,
+                event.get("zone_id"),
+                event.get("actuator_id"),
+                inference_time_ms,
+            ),
+        )
+        await db.commit()
+
+
+async def flush_stats_to_db():
+    """Snapshot in-memory counters to system_stats table."""
+    snap = stats_accumulator.snapshot()
+    total = snap["total_processed"]
+    failures = snap["total_failures"]
+    accuracy = ((total - failures) / total * 100) if total > 0 else 0.0
+    online = len([d for d, t in devices.items()
+                  if utc_now() - t < HEARTBEAT_TIMEOUT])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO system_stats
+               (timestamp, total_processed, total_failures, online_devices, accuracy_rate)
+               VALUES (?, ?, ?, ?, ?)""",
+            (time.time(), total, failures, online, accuracy),
+        )
+        await db.commit()
+
+
+# ------------------------------
+# Zone Trigger State
+# ------------------------------
+
+class ZoneTriggerManager:
+    def __init__(self):
+        self.fired_pairs: set = set()
+        self.zone_last_fired: Dict[str, int] = {}
+        self.frame_counter: int = 0
+        self.pending_events: List[Dict] = []
+
+    def reset(self):
+        self.fired_pairs.clear()
+        self.zone_last_fired.clear()
+        self.frame_counter = 0
+        self.pending_events.clear()
+
+    def process(self, tracked_objects: List[Any]) -> List[Dict]:
+        self.frame_counter += 1
+        events = []
+
+        for obj in tracked_objects:
+            if isinstance(obj, dict):
+                bbox = obj.get("bbox", [0, 0, 0, 0])
+                track_id = obj.get("track_id", None)
+                class_name = obj.get("class_name") or obj.get("class", "Unknown")
+                x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+            else:
+                x1, y1, x2, y2 = obj.bbox
+                track_id = getattr(obj, "track_id", None)
+                class_name = obj.class_name
+
+            leading_edge = x2
+
+            for zone in TRIGGER_ZONES:
+                zone_id = zone["id"]
+                cooldown = zone["cooldown_frames"]
+
+                pair_key = (track_id, zone_id)
+                if track_id is not None and pair_key in self.fired_pairs:
+                    continue
+
+                last_fired = self.zone_last_fired.get(zone_id, -9999)
+                if self.frame_counter - last_fired < cooldown:
+                    continue
+
+                if leading_edge >= zone["x_position"]:
+                    if track_id is not None:
+                        self.fired_pairs.add(pair_key)
+                    self.zone_last_fired[zone_id] = self.frame_counter
+
+                    event = {
+                        "zone_id": zone_id,
+                        "zone_label": zone["label"],
+                        "actuator_id": zone["actuator_id"],
+                        "class_name": class_name,
+                        "track_id": track_id,
+                        "x_position": zone["x_position"],
+                        "timestamp": time.time(),
+                    }
+                    events.append(event)
+
+                    print(
+                        f"[zone] {class_name} (track #{track_id}) "
+                        f"→ {zone['label']} ({zone['actuator_id']}) FIRED "
+                        f"[frame {self.frame_counter}]"
+                    )
+
+        return events
+
+
+zone_trigger_manager = ZoneTriggerManager()
 
 # ------------------------------
 # Centroid Tracker
@@ -199,6 +466,7 @@ class CentroidTracker:
             ))
         return tracked
 
+
 # ------------------------------
 # Class Names Loader
 # ------------------------------
@@ -220,6 +488,7 @@ class ClassNamesLoader:
 
     def get(self) -> List[str]:
         return self.class_names
+
 
 # ------------------------------
 # Model Wrappers
@@ -300,7 +569,6 @@ class CloudInference:
         self.client = InferenceHTTPClient(api_url=ROBOFLOW_API_URL, api_key=ROBOFLOW_API_KEY)
 
     def infer_sync(self, frame: np.ndarray) -> List[Dict]:
-        """Synchronous — call from a thread, never from async directly."""
         file_id = f"{uuid.uuid4()}.jpg"
         file_path = UPLOAD_DIR / file_id
         cv2.imwrite(str(file_path), frame)
@@ -327,6 +595,7 @@ class CloudInference:
                     "confidence": pred["confidence"]
                 })
         return detections
+
 
 # ------------------------------
 # Global State
@@ -358,7 +627,7 @@ system_state = {"mode": SystemMode.RUN, "fault": None, "last_control": None}
 devices: Dict[str, datetime] = {}
 latest_control_command: Dict[str, Any] = {
     "arm": {"azimuth": 0.0, "elevation": 0.0},
-    "conveyor": 0.0,
+    "conveyor": 1.0,
     "vacuum": False
 }
 
@@ -413,8 +682,6 @@ def require_test_mode():
 # PIPELINE THREADS
 # =========================================================
 
-# FIX 2: capture_loop is a plain thread — time.sleep is fine here.
-# It posts frames to capture_queue (thread-safe queue.Queue).
 def capture_loop():
     global pipeline_running, camera_connected
 
@@ -442,7 +709,6 @@ def capture_loop():
         with camera_lock:
             camera_connected = True
 
-        # Drop stale frame — keep only the latest
         if capture_queue.full():
             try:
                 capture_queue.get_nowait()
@@ -457,24 +723,20 @@ def capture_loop():
     print("[capture] Stopped")
 
 
-# FIX 3: inference_loop_thread is a plain thread.
-# It reads from capture_queue (thread-safe), runs model synchronously,
-# then posts the result to the asyncio event loop via run_coroutine_threadsafe.
-# This is the ONLY correct way to hand data from a thread to an async queue.
 def inference_loop_thread():
     global pipeline_running
     last_cloud_time = 0
 
     while pipeline_running:
         if capture_queue.empty():
-            time.sleep(0.001)  # fine here — this IS a plain thread
+            time.sleep(0.001)
             continue
 
         frame = capture_queue.get()
 
         message: Dict[str, Any] = {
             "timestamp": time.time(),
-            "mode": current_mode.value
+            "mode": current_mode.value,
         }
 
         # ---- LOCAL ----
@@ -484,18 +746,34 @@ def inference_loop_thread():
                     frame, conf_threshold, iou_threshold
                 )
 
+                # Count detections for stats
+                if detections:
+                    stats_accumulator.record_detection(len(detections))
+
                 if tracking_enabled and tracker:
                     tracked = tracker.update(detections)
+                    zone_events = zone_trigger_manager.process(tracked)
                     message["type"] = "tracked"
                     message["objects"] = [asdict(t) for t in tracked]
                 else:
+                    zone_events = zone_trigger_manager.process(detections)
                     message["type"] = "detection"
                     message["objects"] = [asdict(d) for d in detections]
 
                 message["inference_time_ms"] = inference_time
+                message["zone_events"] = zone_events
+
+                # Post zone events to DB via event loop (fire-and-forget, non-blocking)
+                if zone_events and main_event_loop is not None:
+                    for ev in zone_events:
+                        asyncio.run_coroutine_threadsafe(
+                            log_zone_event(ev, inference_time),
+                            main_event_loop
+                        )
 
             except Exception as e:
                 print(f"[inference] Local model error: {e}")
+                stats_accumulator.record_failure()
                 continue
 
         # ---- CLOUD ----
@@ -503,25 +781,34 @@ def inference_loop_thread():
             now = time.time()
             if now - last_cloud_time >= CLOUD_INFERENCE_INTERVAL:
                 try:
-                    # FIX 4: Call cloud synchronously from thread — no asyncio.run()
                     detections = cloud_model.infer_sync(frame)
                     last_cloud_time = now
+
+                    if detections:
+                        stats_accumulator.record_detection(len(detections))
+
+                    zone_events = zone_trigger_manager.process(detections)
                     message["type"] = "detection"
                     message["objects"] = detections
+                    message["zone_events"] = zone_events
+
+                    if zone_events and main_event_loop is not None:
+                        for ev in zone_events:
+                            asyncio.run_coroutine_threadsafe(
+                                log_zone_event(ev, 0.0),
+                                main_event_loop
+                            )
                 except Exception as e:
                     print(f"[inference] Cloud error: {e}")
+                    stats_accumulator.record_failure()
                     continue
             else:
-                # Not time yet — don't send a message
                 continue
 
         else:
             continue
 
-        # FIX 5: Post to asyncio.Queue safely from a thread using
-        # run_coroutine_threadsafe — never call async queue directly from a thread.
         if main_event_loop is not None and result_queue_async is not None:
-            # Drop stale result if queue is full
             if result_queue_async.full():
                 try:
                     result_queue_async.get_nowait()
@@ -534,16 +821,13 @@ def inference_loop_thread():
 
 
 # =========================================================
-# BROADCAST LOOP (async coroutine — runs in event loop)
+# BROADCAST LOOP
 # =========================================================
 
-# FIX 6: broadcast_loop is now a proper async coroutine that awaits
-# the asyncio.Queue — no time.sleep, no threading primitives.
 async def broadcast_loop():
     print("[broadcast] Loop started")
     while pipeline_running:
         try:
-            # Wait up to 100ms for a result, then loop to check pipeline_running
             msg = await asyncio.wait_for(result_queue_async.get(), timeout=0.1)
             await inference_ws.broadcast(msg)
         except asyncio.TimeoutError:
@@ -571,6 +855,8 @@ async def start_pipeline():
         except Exception as e:
             raise HTTPException(500, f"Model load failed: {e}")
 
+    zone_trigger_manager.reset()
+
     pipeline_running = True
 
     capture_thread = threading.Thread(target=capture_loop, daemon=True)
@@ -579,7 +865,6 @@ async def start_pipeline():
     capture_thread.start()
     inference_thread.start()
 
-    # Launch broadcast loop as an asyncio task — it lives in the event loop
     asyncio.create_task(broadcast_loop())
 
     return {"status": "started"}
@@ -594,13 +879,26 @@ async def stop_pipeline():
 
     pipeline_running = False
 
-    # Give threads a moment to exit cleanly
     if capture_thread and capture_thread.is_alive():
         capture_thread.join(timeout=2.0)
     if inference_thread and inference_thread.is_alive():
         inference_thread.join(timeout=2.0)
 
     return {"status": "stopped"}
+
+
+# =========================================================
+# ZONE ENDPOINTS
+# =========================================================
+
+@app.get("/zones")
+async def get_zones():
+    return {"zones": TRIGGER_ZONES}
+
+@app.post("/zones/reset")
+async def reset_zones():
+    zone_trigger_manager.reset()
+    return {"status": "zone trigger state cleared"}
 
 
 # =========================================================
@@ -636,8 +934,6 @@ async def get_inference_mode():
 async def load_local_model(model_path: str = LOCAL_MODEL_PATH, model_type: str = LOCAL_MODEL_TYPE):
     global local_model
     try:
-        # FIX 7: Model loading can be slow — run in thread pool so it
-        # doesn't block the event loop
         loop = asyncio.get_event_loop()
         local_model = await loop.run_in_executor(
             None,
@@ -671,7 +967,8 @@ async def reset_tracker():
     if not tracking_enabled:
         raise HTTPException(400, "Tracking is not enabled")
     tracker = CentroidTracker(max_disappeared=TRACKER_MAX_DISAPPEARED, max_distance=TRACKER_MAX_DISTANCE)
-    return {"status": "tracker reset"}
+    zone_trigger_manager.reset()
+    return {"status": "tracker and zone state reset"}
 
 @app.post("/inference/set_cloud_interval")
 async def set_cloud_interval(seconds: int):
@@ -680,6 +977,137 @@ async def set_cloud_interval(seconds: int):
         raise HTTPException(400, "Interval must be at least 1 second")
     CLOUD_INFERENCE_INTERVAL = seconds
     return {"interval": CLOUD_INFERENCE_INTERVAL}
+
+
+# =========================================================
+# REPORTS ENDPOINTS
+# =========================================================
+
+@app.get("/reports")
+async def get_reports():
+    """
+    Returns the latest system_stats row plus live in-memory counters merged together.
+    The in-memory counters are always more current than the DB snapshot.
+    """
+    snap = stats_accumulator.snapshot()
+    total = snap["total_processed"]
+    failures = snap["total_failures"]
+    online = len([d for d, t in devices.items() if utc_now() - t < HEARTBEAT_TIMEOUT])
+    accuracy = ((total - failures) / total * 100) if total > 0 else 0.0
+
+    return {
+        "total_items_processed": total,
+        "failed_inferences": failures,
+        "online_devices": online,
+        "accuracy_rate": round(accuracy, 2),
+    }
+
+@app.get("/reports/history")
+async def get_reports_history(limit: int = 50):
+    """Returns the last N system_stats snapshots for trend graphs."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM system_stats ORDER BY timestamp DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+    return {"history": [dict(r) for r in reversed(rows)]}
+
+
+# =========================================================
+# FAILED INFERENCES ENDPOINTS
+# =========================================================
+
+@app.get("/failed-inferences")
+async def get_failed_inferences(limit: int = 100, reviewed: Optional[int] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if reviewed is not None:
+            cursor = await db.execute(
+                "SELECT * FROM failed_inferences WHERE reviewed=? ORDER BY timestamp DESC LIMIT ?",
+                (reviewed, limit)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM failed_inferences ORDER BY timestamp DESC LIMIT ?", (limit,)
+            )
+        rows = await cursor.fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.patch("/failed-inferences/{item_id}/review")
+async def review_failed_inference(item_id: int, assigned_category: str, notes: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE failed_inferences
+               SET assigned_category=?, reviewed=1, notes=?
+               WHERE id=?""",
+            (assigned_category, notes, item_id)
+        )
+        await db.commit()
+        changes = db.total_changes
+    if changes == 0:
+        raise HTTPException(404, "Item not found")
+    return {"status": "reviewed", "id": item_id, "assigned_category": assigned_category}
+
+
+@app.post("/failed-inferences/{item_id}/retry")
+async def retry_failed_inference(item_id: int):
+    """Reset a reviewed item back to unreviewed so it can be re-labelled."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE failed_inferences SET reviewed=0, assigned_category=NULL WHERE id=?",
+            (item_id,)
+        )
+        await db.commit()
+    return {"status": "reset", "id": item_id}
+
+
+# =========================================================
+# DATABASE CLEAR ENDPOINTS
+# =========================================================
+
+class ClearLevel(str, Enum):
+    STATS_ONLY = "stats_only"          # Clear system_stats history only
+    FAILED_ONLY = "failed_only"        # Clear failed_inferences only
+    LOGS_ONLY = "logs_only"            # Clear inference_logs only
+    ALL = "all"                        # Nuclear — clears everything
+
+
+@app.delete("/database/clear")
+async def clear_database(level: ClearLevel, confirm: str = ""):
+    """
+    Clear database records at the specified level.
+    Requires confirm="CONFIRM" to prevent accidental wipes.
+    """
+    if confirm != "CONFIRM":
+        raise HTTPException(
+            400,
+            "Pass confirm=CONFIRM in query params to proceed. This action is irreversible."
+        )
+
+    cleared = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        if level in (ClearLevel.STATS_ONLY, ClearLevel.ALL):
+            await db.execute("DELETE FROM system_stats")
+            cleared.append("system_stats")
+
+        if level in (ClearLevel.FAILED_ONLY, ClearLevel.ALL):
+            await db.execute("DELETE FROM failed_inferences")
+            cleared.append("failed_inferences")
+
+        if level in (ClearLevel.LOGS_ONLY, ClearLevel.ALL):
+            await db.execute("DELETE FROM inference_logs")
+            cleared.append("inference_logs")
+
+        await db.commit()
+
+    # If clearing all, also reset in-memory counters
+    if level == ClearLevel.ALL:
+        stats_accumulator.__init__()
+
+    print(f"[db] Cleared tables: {cleared}")
+    return {"status": "cleared", "tables": cleared}
 
 
 # =========================================================
@@ -710,6 +1138,7 @@ async def websocket_control(ws: WebSocket):
 @app.websocket("/ws/inference")
 async def websocket_inference(ws: WebSocket):
     await inference_ws.connect(ws)
+    await ws.send_json({"type": "zone_config", "zones": TRIGGER_ZONES})
     try:
         while True:
             await ws.receive_text()
@@ -773,6 +1202,16 @@ async def test_control(cmd: Dict[str, Any]):
 
 @app.get("/test/control")
 async def get_test_control():
+    # DEADMAN: if no recent control, return safe state
+    last = system_state.get("last_control")
+
+    if last and utc_now() - last > CONTROL_DEADMAN_TIMEOUT:
+        return {
+            "arm": {"azimuth": 0.0, "elevation": 0.0},
+            "conveyor": 0.0,
+            "vacuum": False
+        }
+
     return latest_control_command
 
 
@@ -816,14 +1255,6 @@ async def capture_image(device_id: str, file: UploadFile = File(...)):
         if file_path.exists():
             file_path.unlink()
 
-@app.get("/reports")
-async def get_reports():
-    return {
-        "processed": len(list(UPLOAD_DIR.glob("*.jpg"))),
-        "failed": len(list(FAILED_DIR.glob("*.jpg"))),
-        "devices": len(devices)
-    }
-
 
 # =========================================================
 # BACKGROUND TASKS
@@ -849,19 +1280,28 @@ async def control_deadman_watchdog():
                 })
         await asyncio.sleep(0.05)
 
+async def stats_flush_task():
+    """Periodically write in-memory stats to DB. Runs every STATS_FLUSH_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(STATS_FLUSH_INTERVAL)
+        try:
+            await flush_stats_to_db()
+            print(f"[stats] Flushed snapshot: {stats_accumulator.snapshot()}")
+        except Exception as e:
+            print(f"[stats] Flush error: {e}")
+
 
 @app.on_event("startup")
 async def startup_event():
     global main_event_loop, result_queue_async
 
-    # FIX 8: Capture the running event loop reference here so threads
-    # can post to it via run_coroutine_threadsafe.
     main_event_loop = asyncio.get_running_loop()
-
-    # FIX 9: asyncio.Queue must be created inside the running event loop,
-    # not at module level (it would bind to the wrong loop).
     result_queue_async = asyncio.Queue(maxsize=2)
+
+    await init_db()
 
     asyncio.create_task(device_status_cleaner())
     asyncio.create_task(control_deadman_watchdog())
+    asyncio.create_task(stats_flush_task())
+
     print("[startup] EcoSort backend ready")

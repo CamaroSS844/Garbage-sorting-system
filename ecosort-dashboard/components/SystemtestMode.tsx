@@ -62,7 +62,7 @@ const SystemTestMode: React.FC = () => {
         azimuth: (newArm.azimuth - 90) / 90,
         elevation: (newArm.elevation - 90) / 90
       },
-      conveyor: newConv / 100,
+      conveyor: newConv,
       vacuum: newVac
     };
 

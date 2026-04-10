@@ -1,8 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
-  Camera, RefreshCw, CheckCircle2, XCircle, Clock, Video, X, Tag, Info,
-  Globe, Monitor, AlertCircle, Zap, Cpu, Play, Square, SlidersHorizontal,
-  Settings2, Activity, Target, Layers
+  RefreshCw, Video, Tag, Globe, Monitor, AlertCircle, Zap, Cpu,
+  Play, Square, SlidersHorizontal, Activity, Target, Layers
 } from 'lucide-react';
 import SystemTelemetryPanel from './SystemTelemetryPanel';
 import ActuatorStatusPanel from './ActuatorStatusPanel';
@@ -10,6 +9,35 @@ import { InferenceMessage, InferenceDetection } from '../types';
 
 const BASE_URL = 'http://localhost:8000';
 const WS_URL = 'ws://localhost:8000/ws/inference';
+
+// Video dimensions — must match VIDEO_WIDTH / VIDEO_HEIGHT in main.py
+const VIDEO_WIDTH = 640;
+const VIDEO_HEIGHT = 480;
+
+// Zone definition type (mirrors TRIGGER_ZONES in main.py)
+interface TriggerZone {
+  id: string;
+  label: string;
+  actuator_id: string;
+  x_position: number;   // in video pixel space (0–VIDEO_WIDTH)
+  color: string;
+  cooldown_frames: number;
+}
+
+interface ZoneEvent {
+  zone_id: string;
+  zone_label: string;
+  actuator_id: string;
+  class_name: string;
+  track_id: number | null;
+  x_position: number;
+  timestamp: number;
+}
+
+interface ZoneFlash {
+  zone_id: string;
+  expires_at: number;   // performance.now() ms
+}
 
 const LiveCameraFeed: React.FC = () => {
   const [cameraUrl, setCameraUrl] = useState('http://192.168.1.100:81/stream');
@@ -21,22 +49,25 @@ const LiveCameraFeed: React.FC = () => {
   const [cloudInterval, setCloudInterval] = useState(60);
   const [lastInferenceTime, setLastInferenceTime] = useState<number>(0);
 
-  // FIX 1: Store detections in a ref, NOT state.
-  // State updates trigger re-renders and re-create drawDetections via useCallback,
-  // which restarts the rAF loop. A ref is mutated in-place — the loop always
-  // reads the latest value without any of that overhead.
+  // Detections stored in ref — avoids re-render thrash on every WS message
   const detectionsRef = useRef<InferenceDetection[]>([]);
-
-  // Keep a separate state only for the sidebar list — updated at lower priority
   const [detectionsList, setDetectionsList] = useState<InferenceDetection[]>([]);
+
+  // Zone definitions received from backend on WS connect
+  const zonesRef = useRef<TriggerZone[]>([]);
+  const [zonesList, setZonesList] = useState<TriggerZone[]>([]);
+
+  // Active zone flashes — stored in ref so rAF loop reads latest without re-render
+  const zoneFlashesRef = useRef<ZoneFlash[]>([]);
+
+  // Zone event log for the sidebar
+  const [zoneLog, setZoneLog] = useState<ZoneEvent[]>([]);
 
   const canvasOverlayRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const inferenceModeRef = useRef<'local' | 'cloud'>('local');
 
-  // Keep inferenceModeRef in sync so drawDetections (which captures the ref)
-  // always sees the current mode without being recreated.
   useEffect(() => {
     inferenceModeRef.current = inferenceMode;
   }, [inferenceMode]);
@@ -52,22 +83,43 @@ const LiveCameraFeed: React.FC = () => {
 
       ws.onmessage = (event) => {
         try {
-          const data: InferenceMessage = JSON.parse(event.data);
+          const data = JSON.parse(event.data);
 
-          if (data.type === 'camera_status') {
+          // ── Zone config sent once on connect ──────────────────────
+          if (data.type === 'zone_config') {
+            zonesRef.current = data.zones || [];
+            setZonesList(data.zones || []);
+
+          } else if (data.type === 'camera_status') {
             setIsCameraConnected(!!data.connected);
 
           } else if (data.type === 'detection' || data.type === 'tracked') {
             const objs: InferenceDetection[] = data.objects || data.detections || [];
-
-            // FIX 2: Mutate the ref — does NOT trigger a re-render or restart rAF.
             detectionsRef.current = objs;
-
-            // Update the sidebar list separately (lower frequency is fine here)
             setDetectionsList(objs);
 
             if (data.inference_time_ms) {
               setLastInferenceTime(data.inference_time_ms);
+            }
+
+            // ── Handle zone fire events from backend ──────────────
+            if (data.zone_events && data.zone_events.length > 0) {
+              const now = performance.now();
+              const newFlashes: ZoneFlash[] = data.zone_events.map((e: ZoneEvent) => ({
+                zone_id: e.zone_id,
+                expires_at: now + 600,   // flash duration: 600ms
+              }));
+
+              // Merge new flashes, replacing any existing flash for the same zone
+              zoneFlashesRef.current = [
+                ...zoneFlashesRef.current.filter(
+                  f => !newFlashes.some(nf => nf.zone_id === f.zone_id)
+                ),
+                ...newFlashes,
+              ];
+
+              // Append to sidebar log (keep latest 20)
+              setZoneLog(prev => [...data.zone_events, ...prev].slice(0, 20));
             }
           }
         } catch (e) {
@@ -98,18 +150,9 @@ const LiveCameraFeed: React.FC = () => {
           fetch(`${BASE_URL}/inference/get_mode`),
           fetch(`${BASE_URL}/inference/get_thresholds`)
         ]);
-        if (camRes.ok) {
-          const d = await camRes.json();
-          setIsCameraConnected(d.connected);
-        }
-        if (modeRes.ok) {
-          const d = await modeRes.json();
-          setInferenceMode(d.mode);
-        }
-        if (threshRes.ok) {
-          const d = await threshRes.json();
-          setThresholds(d);
-        }
+        if (camRes.ok) { const d = await camRes.json(); setIsCameraConnected(d.connected); }
+        if (modeRes.ok) { const d = await modeRes.json(); setInferenceMode(d.mode); }
+        if (threshRes.ok) { const d = await threshRes.json(); setThresholds(d); }
       } catch (e) {
         console.error('[init] Failed to fetch status', e);
       }
@@ -118,10 +161,9 @@ const LiveCameraFeed: React.FC = () => {
   }, []);
 
   // -------------------------------------------------------
-  // FIX 3: Canvas draw function reads from the ref —
-  // stable identity, never recreated, no deps.
+  // Draw loop — zones + detections on the canvas overlay
   // -------------------------------------------------------
-  const drawDetections = useCallback(() => {
+  const drawFrame = useCallback(() => {
     const canvas = canvasOverlayRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
@@ -129,7 +171,7 @@ const LiveCameraFeed: React.FC = () => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Sync canvas size to container once per frame (cheap compare)
+    // Sync canvas size to container
     const rect = container.getBoundingClientRect();
     if (canvas.width !== rect.width || canvas.height !== rect.height) {
       canvas.width = rect.width;
@@ -138,29 +180,87 @@ const LiveCameraFeed: React.FC = () => {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const detections = detectionsRef.current;
-    if (detections.length === 0) return;
+    const scaleX = canvas.width / VIDEO_WIDTH;
+    const scaleY = canvas.height / VIDEO_HEIGHT;
 
-    const videoWidth = 640;
-    const videoHeight = 480;
-    const scaleX = canvas.width / videoWidth;
-    const scaleY = canvas.height / videoHeight;
+    const now = performance.now();
+
+    // Expire old flashes
+    zoneFlashesRef.current = zoneFlashesRef.current.filter(f => f.expires_at > now);
+    const activeFlashIds = new Set(zoneFlashesRef.current.map(f => f.zone_id));
+
+    // ── DRAW TRIGGER ZONE LINES ──────────────────────────────────
+    zonesRef.current.forEach((zone) => {
+      const cx = zone.x_position * scaleX;
+      const isFlashing = activeFlashIds.has(zone.id);
+
+      ctx.save();
+
+      if (isFlashing) {
+        // Bright solid line + glow effect when zone has just fired
+        ctx.shadowColor = zone.color;
+        ctx.shadowBlur = 12;
+        ctx.strokeStyle = zone.color;
+        ctx.lineWidth = 3;
+        ctx.globalAlpha = 1.0;
+      } else {
+        // Normal: dashed, semi-transparent
+        ctx.strokeStyle = zone.color;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.globalAlpha = 0.7;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, canvas.height);
+      ctx.stroke();
+
+      // Label pill at the top of the line
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+      ctx.shadowBlur = 0;
+      ctx.font = 'bold 11px Inter, sans-serif';
+      const textWidth = ctx.measureText(zone.label).width;
+      const pillW = textWidth + 12;
+      const pillH = 20;
+      const pillX = cx - pillW / 2;
+
+      ctx.fillStyle = isFlashing ? zone.color : zone.color + 'cc';
+      ctx.beginPath();
+      ctx.roundRect(pillX, 6, pillW, pillH, 4);
+      ctx.fill();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(zone.label, pillX + 6, 20);
+
+      // Actuator label below
+      ctx.font = '9px Inter, sans-serif';
+      ctx.fillStyle = zone.color + 'aa';
+      const actLabel = zone.actuator_id;
+      const actW = ctx.measureText(actLabel).width;
+      ctx.fillText(actLabel, cx - actW / 2, 34);
+
+      ctx.restore();
+    });
+    // ── END ZONE LINES ───────────────────────────────────────────
+
+    // ── DRAW DETECTIONS ─────────────────────────────────────────
+    const detections = detectionsRef.current;
 
     detections.forEach((det) => {
       let x: number, y: number, w: number, h: number;
 
       if (inferenceModeRef.current === 'local') {
-        // bbox: [x1, y1, x2, y2] pixel coords
         x = det.bbox[0] * scaleX;
         y = det.bbox[1] * scaleY;
         w = (det.bbox[2] - det.bbox[0]) * scaleX;
         h = (det.bbox[3] - det.bbox[1]) * scaleY;
       } else {
-        // bbox: [center_x, center_y, width, height] normalized
-        const cx = det.bbox[0] * videoWidth;
-        const cy = det.bbox[1] * videoHeight;
-        const bw = det.bbox[2] * videoWidth;
-        const bh = det.bbox[3] * videoHeight;
+        const cx = det.bbox[0] * VIDEO_WIDTH;
+        const cy = det.bbox[1] * VIDEO_HEIGHT;
+        const bw = det.bbox[2] * VIDEO_WIDTH;
+        const bh = det.bbox[3] * VIDEO_HEIGHT;
         x = (cx - bw / 2) * scaleX;
         y = (cy - bh / 2) * scaleY;
         w = bw * scaleX;
@@ -172,13 +272,11 @@ const LiveCameraFeed: React.FC = () => {
         className.toLowerCase().includes('plastic') ? '#10b981' :
         className.toLowerCase().includes('metal')   ? '#3b82f6' : '#f59e0b';
 
-      // Bounding box
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.strokeRect(x, y, w, h);
 
-      // Label
-      const label = `${className} ${(det.confidence * 100).toFixed(0)}%${det.track_id ? ` #${det.track_id}` : ''}`;
+      const label = `${className} ${(det.confidence * 100).toFixed(0)}%${det.track_id != null ? ` #${det.track_id}` : ''}`;
       ctx.font = 'bold 12px Inter, sans-serif';
       const textWidth = ctx.measureText(label).width;
 
@@ -187,23 +285,24 @@ const LiveCameraFeed: React.FC = () => {
 
       ctx.fillStyle = 'white';
       ctx.fillText(label, x + 5, y - 5);
-    });
-  }, []); // empty deps — stable forever
 
-  // -------------------------------------------------------
-  // FIX 4: Continuous rAF loop — runs every frame, completely
-  // independent of React state or WebSocket messages.
-  // drawDetections is stable so this effect runs only once.
-  // -------------------------------------------------------
+      // Draw a small leading-edge marker (the x position the backend measures)
+      const leadingX = (det.bbox[2] ?? det.bbox[0]) * scaleX;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(leadingX, y + h / 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    // ── END DETECTIONS ───────────────────────────────────────────
+  }, []);
+
+  // Continuous rAF loop
   useEffect(() => {
     let animId: number;
-    const loop = () => {
-      drawDetections();
-      animId = requestAnimationFrame(loop);
-    };
+    const loop = () => { drawFrame(); animId = requestAnimationFrame(loop); };
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
-  }, [drawDetections]);
+  }, [drawFrame]);
 
   // -------------------------------------------------------
   // API Control Handlers
@@ -211,9 +310,7 @@ const LiveCameraFeed: React.FC = () => {
   const handleSetCamera = async () => {
     try {
       await fetch(`${BASE_URL}/inference/set_camera?url=${encodeURIComponent(cameraUrl)}`, { method: 'POST' });
-    } catch (e) {
-      console.error('Failed to set camera', e);
-    }
+    } catch (e) { console.error('Failed to set camera', e); }
   };
 
   const toggleInference = async () => {
@@ -221,18 +318,14 @@ const LiveCameraFeed: React.FC = () => {
     try {
       const res = await fetch(`${BASE_URL}/inference/${endpoint}`, { method: 'POST' });
       if (res.ok) setIsInferenceRunning(!isInferenceRunning);
-    } catch (e) {
-      console.error(`Failed to ${endpoint} inference`, e);
-    }
+    } catch (e) { console.error(`Failed to ${endpoint} inference`, e); }
   };
 
   const handleModeChange = async (mode: 'local' | 'cloud') => {
     try {
       const res = await fetch(`${BASE_URL}/inference/set_mode/${mode}`, { method: 'POST' });
       if (res.ok) setInferenceMode(mode);
-    } catch (e) {
-      console.error('Failed to set mode', e);
-    }
+    } catch (e) { console.error('Failed to set mode', e); }
   };
 
   const handleThresholdChange = async (newThresholds: typeof thresholds) => {
@@ -243,9 +336,7 @@ const LiveCameraFeed: React.FC = () => {
         body: JSON.stringify(newThresholds)
       });
       if (res.ok) setThresholds(newThresholds);
-    } catch (e) {
-      console.error('Failed to set thresholds', e);
-    }
+    } catch (e) { console.error('Failed to set thresholds', e); }
   };
 
   const handleTrackingToggle = async () => {
@@ -257,17 +348,13 @@ const LiveCameraFeed: React.FC = () => {
         body: JSON.stringify({ enable: newState })
       });
       if (res.ok) setTrackingEnabled(newState);
-    } catch (e) {
-      console.error('Failed to toggle tracking', e);
-    }
+    } catch (e) { console.error('Failed to toggle tracking', e); }
   };
 
   const handleResetTracker = async () => {
     try {
       await fetch(`${BASE_URL}/inference/tracking/reset`, { method: 'POST' });
-    } catch (e) {
-      console.error('Failed to reset tracker', e);
-    }
+    } catch (e) { console.error('Failed to reset tracker', e); }
   };
 
   const handleCloudIntervalChange = async (seconds: number) => {
@@ -278,9 +365,11 @@ const LiveCameraFeed: React.FC = () => {
         body: JSON.stringify({ seconds })
       });
       if (res.ok) setCloudInterval(seconds);
-    } catch (e) {
-      console.error('Failed to set cloud interval', e);
-    }
+    } catch (e) { console.error('Failed to set cloud interval', e); }
+  };
+
+  const formatTime = (ts: number) => {
+    return new Date(ts * 1000).toLocaleTimeString('en', { hour12: false });
   };
 
   // -------------------------------------------------------
@@ -326,9 +415,7 @@ const LiveCameraFeed: React.FC = () => {
               </div>
             </div>
 
-            {/* FIX 5: Video feed is a plain <img> for MJPEG — correct approach.
-                The canvas sits on top. Both are positioned absolute inside
-                the relative container so they perfectly overlap. */}
+            {/* Video + Canvas overlay */}
             <div ref={containerRef} className="relative aspect-video bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-inner">
               <img
                 src={cameraUrl}
@@ -338,7 +425,6 @@ const LiveCameraFeed: React.FC = () => {
                 alt="Live camera feed"
               />
 
-              {/* Overlay canvas — pointer-events-none so it never blocks the feed */}
               <canvas
                 ref={canvasOverlayRef}
                 className="absolute inset-0 w-full h-full pointer-events-none z-10"
@@ -348,6 +434,19 @@ const LiveCameraFeed: React.FC = () => {
                 <div className="absolute top-4 right-4 z-20 flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
                   <Activity size={14} className="text-emerald-400 animate-pulse" />
                   <span className="text-[10px] font-black text-white uppercase tracking-wider">Inference Active</span>
+                </div>
+              )}
+
+              {/* Zone legend overlay — bottom left */}
+              {zonesList.length > 0 && (
+                <div className="absolute bottom-4 left-4 z-20 flex flex-col gap-1">
+                  {zonesList.map(zone => (
+                    <div key={zone.id} className="flex items-center gap-2 bg-black/50 backdrop-blur-sm px-2 py-1 rounded-lg">
+                      <div className="w-2.5 h-2.5 rounded-sm" style={{ background: zone.color }} />
+                      <span className="text-[10px] font-bold text-white">{zone.label}</span>
+                      <span className="text-[9px] text-white/50">{zone.actuator_id}</span>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -412,7 +511,7 @@ const LiveCameraFeed: React.FC = () => {
                   </div>
 
                   {inferenceMode === 'cloud' && (
-                    <div className="space-y-2 animate-in fade-in slide-in-from-top-2">
+                    <div className="space-y-2">
                       <div className="flex justify-between text-[10px] font-black text-slate-400 uppercase tracking-wider">
                         <span>Cloud Interval</span>
                         <span className="text-amber-600">{cloudInterval}s</span>
@@ -462,6 +561,8 @@ const LiveCameraFeed: React.FC = () => {
 
         {/* Sidebar */}
         <div className="lg:col-span-4 space-y-6">
+
+          {/* Live Detections */}
           <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
@@ -473,7 +574,7 @@ const LiveCameraFeed: React.FC = () => {
               </span>
             </div>
 
-            <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+            <div className="space-y-3 max-h-[240px] overflow-y-auto pr-2">
               {detectionsList.length > 0 ? (
                 detectionsList.map((det, idx) => (
                   <div
@@ -488,7 +589,7 @@ const LiveCameraFeed: React.FC = () => {
                       <div>
                         <p className="text-sm font-bold text-slate-800 capitalize">{det.class_name || det.class || 'Unknown'}</p>
                         <p className="text-[10px] font-medium text-slate-500">
-                          {det.track_id ? `Track #${det.track_id} · ` : ''}
+                          {det.track_id != null ? `Track #${det.track_id} · ` : ''}
                           Conf: {Math.round(det.confidence * 100)}%
                         </p>
                       </div>
@@ -499,9 +600,9 @@ const LiveCameraFeed: React.FC = () => {
                   </div>
                 ))
               ) : (
-                <div className="text-center py-12 space-y-3">
-                  <div className="w-12 h-12 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
-                    <Activity size={20} className="text-slate-300" />
+                <div className="text-center py-8 space-y-2">
+                  <div className="w-10 h-10 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
+                    <Activity size={18} className="text-slate-300" />
                   </div>
                   <p className="text-xs font-medium text-slate-400">No objects detected</p>
                 </div>
@@ -509,11 +610,61 @@ const LiveCameraFeed: React.FC = () => {
             </div>
 
             {lastInferenceTime > 0 && (
-              <div className="mt-6 pt-6 border-t border-slate-100 flex items-center justify-between">
+              <div className="mt-4 pt-4 border-t border-slate-100 flex items-center justify-between">
                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider">Inference latency</span>
                 <span className="text-xs font-bold text-slate-600">{lastInferenceTime.toFixed(1)} ms</span>
               </div>
             )}
+          </div>
+
+          {/* Zone Trigger Log */}
+          <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                <Zap size={16} className="text-amber-500" />
+                Zone Trigger Log
+              </h3>
+              <button
+                onClick={() => setZoneLog([])}
+                className="text-[10px] font-bold text-slate-400 hover:text-slate-600 transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+              {zoneLog.length > 0 ? (
+                zoneLog.map((event, idx) => {
+                  const zone = zonesList.find(z => z.id === event.zone_id);
+                  return (
+                    <div key={idx} className="flex items-start gap-3 p-3 bg-slate-50 rounded-xl border border-slate-100">
+                      <div
+                        className="w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0"
+                        style={{ background: zone?.color ?? '#888' }}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-bold text-slate-800 truncate">
+                          {event.class_name}
+                          {event.track_id != null && (
+                            <span className="font-normal text-slate-400"> #{event.track_id}</span>
+                          )}
+                        </p>
+                        <p className="text-[10px] text-slate-500">
+                          {event.zone_label} · {event.actuator_id}
+                        </p>
+                      </div>
+                      <span className="text-[9px] text-slate-400 flex-shrink-0 mt-0.5">
+                        {formatTime(event.timestamp)}
+                      </span>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="text-center py-8">
+                  <p className="text-xs text-slate-400">No triggers yet</p>
+                </div>
+              )}
+            </div>
           </div>
 
           <ActuatorStatusPanel />
@@ -536,8 +687,8 @@ const LiveCameraFeed: React.FC = () => {
               <Cpu size={120} />
             </div>
           </div>
-        </div>
 
+        </div>
       </div>
     </div>
   );
