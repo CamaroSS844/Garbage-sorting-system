@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   RefreshCw, Video, Tag, Globe, Monitor, AlertCircle, Zap, Cpu,
-  Play, Square, SlidersHorizontal, Activity, Target, Layers
+  Play, Square, SlidersHorizontal, Activity, Target, Layers, Radio, Wifi
 } from 'lucide-react';
 import SystemTelemetryPanel from './SystemTelemetryPanel';
 import ActuatorStatusPanel from './ActuatorStatusPanel';
@@ -13,6 +13,15 @@ const WS_URL = 'ws://localhost:8000/ws/inference';
 // Video dimensions — must match VIDEO_WIDTH / VIDEO_HEIGHT in main.py
 const VIDEO_WIDTH = 640;
 const VIDEO_HEIGHT = 480;
+
+// -------------------------------------------------------
+// MediaMTX WebRTC configuration
+// -------------------------------------------------------
+// Set this to your MediaMTX server's WHEP endpoint.
+// Example: "http://192.168.1.100:8889/mystream/whep"
+const MEDIAMTX_WHEP_URL = 'http://localhost:8889/stream1/whep';
+const MEDIAMTX_USER = '';   // fill if auth is enabled
+const MEDIAMTX_PASS = '';   // fill if auth is enabled
 
 // Zone definition type (mirrors TRIGGER_ZONES in main.py)
 interface TriggerZone {
@@ -39,8 +48,99 @@ interface ZoneFlash {
   expires_at: number;   // performance.now() ms
 }
 
+// -------------------------------------------------------
+// Minimal MediaMTX WebRTC reader (no external reader.js needed)
+// Uses the WHEP (WebRTC-HTTP Egress Protocol) standard directly.
+// -------------------------------------------------------
+class MediaMTXWebRTCReader {
+  private pc: RTCPeerConnection | null = null;
+  private url: string;
+  private user: string;
+  private pass: string;
+  private onTrack: (evt: RTCTrackEvent) => void;
+  private onError: (err: Error) => void;
+  private closed = false;
+
+  constructor(opts: {
+    url: string;
+    user?: string;
+    pass?: string;
+    onTrack: (evt: RTCTrackEvent) => void;
+    onError: (err: Error) => void;
+  }) {
+    this.url = opts.url;
+    this.user = opts.user ?? '';
+    this.pass = opts.pass ?? '';
+    this.onTrack = opts.onTrack;
+    this.onError = opts.onError;
+    this.start();
+  }
+
+  private async start() {
+    try {
+      this.pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      this.pc.ontrack = (evt) => {
+        if (!this.closed) this.onTrack(evt);
+      };
+
+      // Add receive-only transceivers so the offer contains the right direction
+      this.pc.addTransceiver('video', { direction: 'recvonly' });
+      this.pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering to finish
+      await new Promise<void>((resolve) => {
+        if (this.pc!.iceGatheringState === 'complete') { resolve(); return; }
+        const check = () => {
+          if (this.pc!.iceGatheringState === 'complete') {
+            this.pc!.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        this.pc!.addEventListener('icegatheringstatechange', check);
+        // Fallback timeout
+        setTimeout(resolve, 3000);
+      });
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/sdp' };
+      if (this.user && this.pass) {
+        headers['Authorization'] = 'Basic ' + btoa(`${this.user}:${this.pass}`);
+      }
+
+      const res = await fetch(this.url, {
+        method: 'POST',
+        headers,
+        body: this.pc.localDescription!.sdp,
+      });
+
+      if (!res.ok) throw new Error(`WHEP response ${res.status}: ${await res.text()}`);
+
+      const answerSdp = await res.text();
+      await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    } catch (err) {
+      if (!this.closed) this.onError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  close() {
+    this.closed = true;
+    this.pc?.close();
+    this.pc = null;
+  }
+}
+
+// -------------------------------------------------------
+// Feed source type
+// -------------------------------------------------------
+type FeedSource = 'mjpeg' | 'webrtc';
+
 const LiveCameraFeed: React.FC = () => {
-  const [cameraUrl, setCameraUrl] = useState('http://192.168.1.100:81/stream');
+  const [cameraUrl, setCameraUrl] = useState('http://192.168.100.103:9000/video');
   const [isCameraConnected, setIsCameraConnected] = useState(false);
   const [isInferenceRunning, setIsInferenceRunning] = useState(false);
   const [inferenceMode, setInferenceMode] = useState<'local' | 'cloud'>('local');
@@ -48,6 +148,13 @@ const LiveCameraFeed: React.FC = () => {
   const [trackingEnabled, setTrackingEnabled] = useState(false);
   const [cloudInterval, setCloudInterval] = useState(60);
   const [lastInferenceTime, setLastInferenceTime] = useState<number>(0);
+
+  // ── Feed source toggle ────────────────────────────────
+  const [feedSource, setFeedSource] = useState<FeedSource>('mjpeg');
+  const [webrtcStatus, setWebrtcStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+  const [webrtcError, setWebrtcError] = useState<string | null>(null);
+  const webrtcReaderRef = useRef<MediaMTXWebRTCReader | null>(null);
+  const webrtcVideoRef = useRef<HTMLVideoElement>(null);
 
   // Detections stored in ref — avoids re-render thrash on every WS message
   const detectionsRef = useRef<InferenceDetection[]>([]);
@@ -73,6 +180,62 @@ const LiveCameraFeed: React.FC = () => {
   }, [inferenceMode]);
 
   // -------------------------------------------------------
+  // WebRTC feed management
+  // -------------------------------------------------------
+  const startWebRTC = useCallback(() => {
+    // Clean up any existing reader
+    if (webrtcReaderRef.current) {
+      webrtcReaderRef.current.close();
+      webrtcReaderRef.current = null;
+    }
+
+    setWebrtcStatus('connecting');
+    setWebrtcError(null);
+
+    webrtcReaderRef.current = new MediaMTXWebRTCReader({
+      url: MEDIAMTX_WHEP_URL,
+      user: MEDIAMTX_USER,
+      pass: MEDIAMTX_PASS,
+      onTrack: (evt) => {
+        if (webrtcVideoRef.current && evt.streams[0]) {
+          webrtcVideoRef.current.srcObject = evt.streams[0];
+          setWebrtcStatus('connected');
+          setIsCameraConnected(true);
+        }
+      },
+      onError: (err) => {
+        console.error('[webrtc]', err);
+        setWebrtcStatus('error');
+        setWebrtcError(err.message);
+        setIsCameraConnected(false);
+      },
+    });
+  }, []);
+
+  const stopWebRTC = useCallback(() => {
+    if (webrtcReaderRef.current) {
+      webrtcReaderRef.current.close();
+      webrtcReaderRef.current = null;
+    }
+    if (webrtcVideoRef.current) {
+      webrtcVideoRef.current.srcObject = null;
+    }
+    setWebrtcStatus('idle');
+  }, []);
+
+  // Switch feed source
+  useEffect(() => {
+    if (feedSource === 'webrtc') {
+      startWebRTC();
+    } else {
+      stopWebRTC();
+    }
+    return () => {
+      if (feedSource === 'webrtc') stopWebRTC();
+    };
+  }, [feedSource, startWebRTC, stopWebRTC]);
+
+  // -------------------------------------------------------
   // WebSocket Connection
   // -------------------------------------------------------
   useEffect(() => {
@@ -85,13 +248,15 @@ const LiveCameraFeed: React.FC = () => {
         try {
           const data = JSON.parse(event.data);
 
-          // ── Zone config sent once on connect ──────────────────────
           if (data.type === 'zone_config') {
             zonesRef.current = data.zones || [];
             setZonesList(data.zones || []);
 
           } else if (data.type === 'camera_status') {
-            setIsCameraConnected(!!data.connected);
+            // Only update camera status from WS when using MJPEG feed
+            if (feedSource === 'mjpeg') {
+              setIsCameraConnected(!!data.connected);
+            }
 
           } else if (data.type === 'detection' || data.type === 'tracked') {
             const objs: InferenceDetection[] = data.objects || data.detections || [];
@@ -102,15 +267,13 @@ const LiveCameraFeed: React.FC = () => {
               setLastInferenceTime(data.inference_time_ms);
             }
 
-            // ── Handle zone fire events from backend ──────────────
             if (data.zone_events && data.zone_events.length > 0) {
               const now = performance.now();
               const newFlashes: ZoneFlash[] = data.zone_events.map((e: ZoneEvent) => ({
                 zone_id: e.zone_id,
-                expires_at: now + 600,   // flash duration: 600ms
+                expires_at: now + 600,
               }));
 
-              // Merge new flashes, replacing any existing flash for the same zone
               zoneFlashesRef.current = [
                 ...zoneFlashesRef.current.filter(
                   f => !newFlashes.some(nf => nf.zone_id === f.zone_id)
@@ -118,7 +281,6 @@ const LiveCameraFeed: React.FC = () => {
                 ...newFlashes,
               ];
 
-              // Append to sidebar log (keep latest 20)
               setZoneLog(prev => [...data.zone_events, ...prev].slice(0, 20));
             }
           }
@@ -137,7 +299,7 @@ const LiveCameraFeed: React.FC = () => {
 
     connectWS();
     return () => wsRef.current?.close();
-  }, []);
+  }, []); // feedSource intentionally excluded — we only gate isCameraConnected update above
 
   // -------------------------------------------------------
   // Poll Initial Status
@@ -150,7 +312,7 @@ const LiveCameraFeed: React.FC = () => {
           fetch(`${BASE_URL}/inference/get_mode`),
           fetch(`${BASE_URL}/inference/get_thresholds`)
         ]);
-        if (camRes.ok) { const d = await camRes.json(); setIsCameraConnected(d.connected); }
+        if (camRes.ok) { const d = await camRes.json(); if (feedSource === 'mjpeg') setIsCameraConnected(d.connected); }
         if (modeRes.ok) { const d = await modeRes.json(); setInferenceMode(d.mode); }
         if (threshRes.ok) { const d = await threshRes.json(); setThresholds(d); }
       } catch (e) {
@@ -171,7 +333,6 @@ const LiveCameraFeed: React.FC = () => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Sync canvas size to container
     const rect = container.getBoundingClientRect();
     if (canvas.width !== rect.width || canvas.height !== rect.height) {
       canvas.width = rect.width;
@@ -185,7 +346,6 @@ const LiveCameraFeed: React.FC = () => {
 
     const now = performance.now();
 
-    // Expire old flashes
     zoneFlashesRef.current = zoneFlashesRef.current.filter(f => f.expires_at > now);
     const activeFlashIds = new Set(zoneFlashesRef.current.map(f => f.zone_id));
 
@@ -197,14 +357,12 @@ const LiveCameraFeed: React.FC = () => {
       ctx.save();
 
       if (isFlashing) {
-        // Bright solid line + glow effect when zone has just fired
         ctx.shadowColor = zone.color;
         ctx.shadowBlur = 12;
         ctx.strokeStyle = zone.color;
         ctx.lineWidth = 3;
         ctx.globalAlpha = 1.0;
       } else {
-        // Normal: dashed, semi-transparent
         ctx.strokeStyle = zone.color;
         ctx.lineWidth = 1.5;
         ctx.setLineDash([6, 4]);
@@ -216,7 +374,6 @@ const LiveCameraFeed: React.FC = () => {
       ctx.lineTo(cx, canvas.height);
       ctx.stroke();
 
-      // Label pill at the top of the line
       ctx.setLineDash([]);
       ctx.globalAlpha = 1.0;
       ctx.shadowBlur = 0;
@@ -234,7 +391,6 @@ const LiveCameraFeed: React.FC = () => {
       ctx.fillStyle = '#ffffff';
       ctx.fillText(zone.label, pillX + 6, 20);
 
-      // Actuator label below
       ctx.font = '9px Inter, sans-serif';
       ctx.fillStyle = zone.color + 'aa';
       const actLabel = zone.actuator_id;
@@ -243,7 +399,6 @@ const LiveCameraFeed: React.FC = () => {
 
       ctx.restore();
     });
-    // ── END ZONE LINES ───────────────────────────────────────────
 
     // ── DRAW DETECTIONS ─────────────────────────────────────────
     const detections = detectionsRef.current;
@@ -286,14 +441,12 @@ const LiveCameraFeed: React.FC = () => {
       ctx.fillStyle = 'white';
       ctx.fillText(label, x + 5, y - 5);
 
-      // Draw a small leading-edge marker (the x position the backend measures)
       const leadingX = (det.bbox[2] ?? det.bbox[0]) * scaleX;
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(leadingX, y + h / 2, 3, 0, Math.PI * 2);
       ctx.fill();
     });
-    // ── END DETECTIONS ───────────────────────────────────────────
   }, []);
 
   // Continuous rAF loop
@@ -368,9 +521,31 @@ const LiveCameraFeed: React.FC = () => {
     } catch (e) { console.error('Failed to set cloud interval', e); }
   };
 
+  const handleFeedSourceToggle = () => {
+    setFeedSource(prev => prev === 'mjpeg' ? 'webrtc' : 'mjpeg');
+  };
+
+  const handleRetryWebRTC = () => {
+    if (feedSource === 'webrtc') startWebRTC();
+  };
+
   const formatTime = (ts: number) => {
     return new Date(ts * 1000).toLocaleTimeString('en', { hour12: false });
   };
+
+  // -------------------------------------------------------
+  // Derived state
+  // -------------------------------------------------------
+  const isConnected = feedSource === 'webrtc'
+    ? webrtcStatus === 'connected'
+    : isCameraConnected;
+
+  const connectionLabel = feedSource === 'webrtc'
+    ? webrtcStatus === 'connected' ? 'WebRTC Connected'
+      : webrtcStatus === 'connecting' ? 'WebRTC Connecting…'
+      : webrtcStatus === 'error' ? 'WebRTC Error'
+      : 'WebRTC Idle'
+    : isCameraConnected ? 'Camera Connected' : 'Camera Disconnected';
 
   // -------------------------------------------------------
   // Render
@@ -390,56 +565,156 @@ const LiveCameraFeed: React.FC = () => {
                 <div>
                   <h2 className="text-lg font-bold text-slate-800">Live Vision Feed</h2>
                   <div className="flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${isCameraConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
-                    <span className="text-xs font-medium text-slate-500">
-                      {isCameraConnected ? 'Camera Connected' : 'Camera Disconnected'}
-                    </span>
+                    <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : webrtcStatus === 'connecting' ? 'bg-amber-400 animate-pulse' : 'bg-slate-300'}`} />
+                    <span className="text-xs font-medium text-slate-500">{connectionLabel}</span>
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded-2xl border border-slate-100 w-full sm:w-auto">
-                <input
-                  type="text"
-                  value={cameraUrl}
-                  onChange={(e) => setCameraUrl(e.target.value)}
-                  placeholder="Camera Stream URL"
-                  className="bg-transparent px-3 py-1.5 text-sm outline-none w-full sm:w-64 font-medium text-slate-600"
-                />
-                <button
-                  onClick={handleSetCamera}
-                  className="bg-slate-900 text-white px-4 py-1.5 rounded-xl text-xs font-bold hover:bg-slate-800 transition-all"
-                >
-                  Set
-                </button>
+              <div className="flex items-center gap-3 flex-wrap">
+                {/* Feed source toggle */}
+                <div className="flex items-center bg-slate-50 p-1 rounded-2xl border border-slate-100">
+                  <button
+                    onClick={() => setFeedSource('mjpeg')}
+                    title="MJPEG / HTTP stream"
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${feedSource === 'mjpeg' ? 'bg-white text-slate-800 shadow-sm border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}
+                  >
+                    <Monitor size={13} /> MJPEG
+                  </button>
+                  <button
+                    onClick={() => setFeedSource('webrtc')}
+                    title="MediaMTX WebRTC (WHEP)"
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${feedSource === 'webrtc' ? 'bg-white text-indigo-600 shadow-sm border border-slate-200' : 'text-slate-400 hover:text-slate-600'}`}
+                  >
+                    <Radio size={13} /> WebRTC
+                  </button>
+                </div>
+
+                {/* Camera URL input — only shown in MJPEG mode */}
+                {feedSource === 'mjpeg' && (
+                  <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded-2xl border border-slate-100">
+                    <input
+                      type="text"
+                      value={cameraUrl}
+                      onChange={(e) => setCameraUrl(e.target.value)}
+                      placeholder="Camera Stream URL"
+                      className="bg-transparent px-3 py-1.5 text-sm outline-none w-full sm:w-56 font-medium text-slate-600"
+                    />
+                    <button
+                      onClick={handleSetCamera}
+                      className="bg-slate-900 text-white px-4 py-1.5 rounded-xl text-xs font-bold hover:bg-slate-800 transition-all"
+                    >
+                      Set
+                    </button>
+                  </div>
+                )}
+
+                {/* WebRTC retry / status — only shown in WebRTC mode */}
+                {feedSource === 'webrtc' && webrtcStatus === 'error' && (
+                  <button
+                    onClick={handleRetryWebRTC}
+                    className="flex items-center gap-1.5 bg-rose-50 text-rose-600 border border-rose-200 px-3 py-1.5 rounded-xl text-xs font-bold hover:bg-rose-100 transition-all"
+                  >
+                    <RefreshCw size={13} /> Retry
+                  </button>
+                )}
+
+                {feedSource === 'webrtc' && webrtcStatus === 'connecting' && (
+                  <div className="flex items-center gap-1.5 text-amber-600 text-xs font-bold">
+                    <Wifi size={13} className="animate-pulse" /> Connecting…
+                  </div>
+                )}
               </div>
             </div>
 
             {/* Video + Canvas overlay */}
             <div ref={containerRef} className="relative aspect-video bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-inner">
-              <img
-                src={cameraUrl}
-                className="absolute inset-0 w-full h-full object-contain"
-                onError={() => setIsCameraConnected(false)}
-                onLoad={() => setIsCameraConnected(true)}
-                alt="Live camera feed"
-              />
 
+              {/* ── MJPEG feed (img tag) ── */}
+              {feedSource === 'mjpeg' && (
+                <img
+                  src={cameraUrl}
+                  className="absolute inset-0 w-full h-full object-contain"
+                  onError={() => setIsCameraConnected(false)}
+                  onLoad={() => setIsCameraConnected(true)}
+                  alt="Live camera feed"
+                />
+              )}
+
+              {/* ── WebRTC feed (video tag) ── */}
+              {feedSource === 'webrtc' && (
+                <video
+                  ref={webrtcVideoRef}
+                  className="absolute inset-0 w-full h-full object-contain"
+                  autoPlay
+                  muted
+                  playsInline
+                />
+              )}
+
+              {/* WebRTC error / connecting overlay */}
+              {feedSource === 'webrtc' && webrtcStatus !== 'connected' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-slate-900/80 gap-3">
+                  {webrtcStatus === 'connecting' && (
+                    <>
+                      <Wifi size={32} className="text-amber-400 animate-pulse" />
+                      <p className="text-white text-sm font-semibold">Connecting to MediaMTX…</p>
+                      <p className="text-slate-400 text-xs">{MEDIAMTX_WHEP_URL}</p>
+                    </>
+                  )}
+                  {webrtcStatus === 'error' && (
+                    <>
+                      <AlertCircle size={32} className="text-rose-400" />
+                      <p className="text-white text-sm font-semibold">WebRTC Connection Failed</p>
+                      <p className="text-slate-400 text-xs max-w-xs text-center">{webrtcError}</p>
+                      <button
+                        onClick={handleRetryWebRTC}
+                        className="mt-2 flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-xl text-xs font-bold transition-all border border-white/20"
+                      >
+                        <RefreshCw size={13} /> Retry Connection
+                      </button>
+                    </>
+                  )}
+                  {webrtcStatus === 'idle' && (
+                    <>
+                      <Radio size={32} className="text-slate-500" />
+                      <p className="text-slate-400 text-sm">WebRTC feed idle</p>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Canvas overlay for zones + detections — always on top */}
               <canvas
                 ref={canvasOverlayRef}
-                className="absolute inset-0 w-full h-full pointer-events-none z-10"
+                className="absolute inset-0 w-full h-full pointer-events-none z-20"
               />
 
               {isInferenceRunning && (
-                <div className="absolute top-4 right-4 z-20 flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
+                <div className="absolute top-4 right-4 z-30 flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
                   <Activity size={14} className="text-emerald-400 animate-pulse" />
                   <span className="text-[10px] font-black text-white uppercase tracking-wider">Inference Active</span>
                 </div>
               )}
 
+              {/* Feed source badge */}
+              <div className="absolute top-4 left-4 z-30">
+                {feedSource === 'webrtc' ? (
+                  <div className="flex items-center gap-1.5 bg-indigo-600/80 backdrop-blur-sm px-2.5 py-1 rounded-full border border-indigo-400/30">
+                    <Radio size={10} className="text-indigo-200" />
+                    <span className="text-[10px] font-black text-white uppercase tracking-wider">WebRTC</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 bg-slate-900/60 backdrop-blur-sm px-2.5 py-1 rounded-full border border-white/10">
+                    <Monitor size={10} className="text-slate-300" />
+                    <span className="text-[10px] font-black text-slate-200 uppercase tracking-wider">MJPEG</span>
+                  </div>
+                )}
+              </div>
+
               {/* Zone legend overlay — bottom left */}
               {zonesList.length > 0 && (
-                <div className="absolute bottom-4 left-4 z-20 flex flex-col gap-1">
+                <div className="absolute bottom-4 left-4 z-30 flex flex-col gap-1">
                   {zonesList.map(zone => (
                     <div key={zone.id} className="flex items-center gap-2 bg-black/50 backdrop-blur-sm px-2 py-1 rounded-lg">
                       <div className="w-2.5 h-2.5 rounded-sm" style={{ background: zone.color }} />

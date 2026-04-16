@@ -1,0 +1,1 @@
+{"timestamp":1773268303.3586717,"mode":"local","type":"detection","objects":[{"bbox":[229,52,270,103],"confidence":0.6252190470695496,"class_id":2,"class_name":"plastic"}],"inference_time_ms":638.0023956298828}
