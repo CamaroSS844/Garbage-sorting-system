@@ -13,8 +13,8 @@ import time
 import math
 from collections import OrderedDict
 import queue
-import sqlite3
 import aiosqlite
+import base64
 
 # --- Inference libraries ---
 import torch
@@ -50,8 +50,8 @@ DEFAULT_CAMERA_URL = "http://192.168.43.133:9000/video"
 LOCAL_INFERENCE_FPS = 10
 CLOUD_INFERENCE_INTERVAL = 30
 
-LOCAL_MODEL_PATH = r"C:\Users\Taboka\Documents\others\personal final project\withOnnx\latest.pt"
-LOCAL_MODEL_TYPE = "ultralytics"
+LOCAL_MODEL_PATH = r"C:\Users\Taboka\Documents\others\personal final project\withOnnx\latest.onnx"
+LOCAL_MODEL_TYPE = "onnx"
 
 CONF_THRESHOLD = 0.5
 IOU_THRESHOLD = 0.45
@@ -62,9 +62,19 @@ TRACKER_MAX_DISTANCE = 50
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 
-# How often (in seconds) to flush an aggregated stats snapshot to DB.
-# Keeps DB writes infrequent so they don't affect inference latency.
-STATS_FLUSH_INTERVAL = 30  # seconds
+# Hardcoded class names — must match the order your model was trained with
+CLASS_NAMES: List[str] = [
+    "metal",
+    "paper",
+    "plastic",
+    "plastic-bottle",
+    "glass",
+]
+
+RTSP_TRANSPORT = "tcp"
+FRAME_JPEG_QUALITY = 60
+FRAME_SEND_INTERVAL = 0
+STATS_FLUSH_INTERVAL = 30
 
 TRIGGER_ZONES = [
     {
@@ -116,16 +126,16 @@ pipeline_running = False
 
 main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
+latest_frame_lock = threading.Lock()
+latest_raw_frame: Optional[np.ndarray] = None
+
+_frame_send_counter = 0
+
 # ------------------------------
 # In-memory stats accumulator
-# (written by inference thread, flushed to DB periodically by async task)
 # ------------------------------
 
 class StatsAccumulator:
-    """
-    Thread-safe counters incremented during inference.
-    Periodically snapshotted and written to DB without blocking inference.
-    """
     def __init__(self):
         self._lock = threading.Lock()
         self.total_processed: int = 0
@@ -169,7 +179,6 @@ class TrackedObject(Detection):
 # ------------------------------
 
 async def init_db():
-    """Create tables and seed demo failed_inference rows if empty."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inference_logs (
@@ -185,7 +194,6 @@ async def init_db():
                 inference_time_ms REAL
             )
         """)
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS failed_inferences (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +207,6 @@ async def init_db():
                 notes               TEXT
             )
         """)
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS system_stats (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,44 +217,15 @@ async def init_db():
                 accuracy_rate    REAL    DEFAULT 0.0
             )
         """)
-
         await db.commit()
 
-        # Seed 3 demo failed inference rows only if table is empty
         cursor = await db.execute("SELECT COUNT(*) FROM failed_inferences")
         row = await cursor.fetchone()
         if row[0] == 0:
             demo_rows = [
-                (
-                    time.time() - 3600,          # 1 hour ago
-                    None,                         # image_path
-                    "esp32-node-01",              # device_id
-                    0.21,                         # confidence
-                    "Plastic",                    # original_guess
-                    None,                         # assigned_category (not reviewed yet)
-                    0,                            # reviewed
-                    "Low confidence on conveyor belt edge",  # notes
-                ),
-                (
-                    time.time() - 1800,
-                    None,
-                    "esp32-node-02",
-                    0.18,
-                    "Metal",
-                    None,
-                    0,
-                    "Blurry frame during high-speed pass",
-                ),
-                (
-                    time.time() - 600,
-                    None,
-                    "esp32-node-01",
-                    0.09,
-                    "Glass",
-                    None,
-                    0,
-                    "Occlusion — item partially behind belt guide",
-                ),
+                (time.time() - 3600, None, "esp32-node-01", 0.21, "Plastic", None, 0, "Low confidence on conveyor belt edge"),
+                (time.time() - 1800, None, "esp32-node-02", 0.18, "Metal",   None, 0, "Blurry frame during high-speed pass"),
+                (time.time() - 600,  None, "esp32-node-01", 0.09, "Glass",   None, 0, "Occlusion — item partially behind belt guide"),
             ]
             await db.executemany(
                 """INSERT INTO failed_inferences
@@ -261,7 +239,6 @@ async def init_db():
 
 
 async def log_zone_event(event: Dict[str, Any], inference_time_ms: float = 0.0):
-    """Write a single zone-fire detection to inference_logs (non-blocking)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO inference_logs
@@ -281,14 +258,11 @@ async def log_zone_event(event: Dict[str, Any], inference_time_ms: float = 0.0):
 
 
 async def flush_stats_to_db():
-    """Snapshot in-memory counters to system_stats table."""
     snap = stats_accumulator.snapshot()
     total = snap["total_processed"]
     failures = snap["total_failures"]
     accuracy = ((total - failures) / total * 100) if total > 0 else 0.0
-    online = len([d for d, t in devices.items()
-                  if utc_now() - t < HEARTBEAT_TIMEOUT])
-
+    online = len([d for d, t in devices.items() if utc_now() - t < HEARTBEAT_TIMEOUT])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO system_stats
@@ -360,7 +334,6 @@ class ZoneTriggerManager:
                         "timestamp": time.time(),
                     }
                     events.append(event)
-
                     print(
                         f"[zone] {class_name} (track #{track_id}) "
                         f"→ {zone['label']} ({zone['actuator_id']}) FIRED "
@@ -421,7 +394,6 @@ class CentroidTracker:
 
             rows = D.min(axis=1).argsort()
             cols = D.argmin(axis=1)
-
             used_rows = set()
             used_cols = set()
 
@@ -439,8 +411,7 @@ class CentroidTracker:
                 used_rows.add(row)
                 used_cols.add(col)
 
-            unused_rows = set(range(len(object_centroids))) - used_rows
-            for row in unused_rows:
+            for row in set(range(len(object_centroids))) - used_rows:
                 track_id = object_ids[row]
                 centroid, bbox, class_name, confidence, disappeared = self.objects[track_id]
                 disappeared += 1
@@ -449,8 +420,7 @@ class CentroidTracker:
                 else:
                     self.objects[track_id] = (centroid, bbox, class_name, confidence, disappeared)
 
-            unused_cols = set(range(len(detection_centroids))) - used_cols
-            for col in unused_cols:
+            for col in set(range(len(detection_centroids))) - used_cols:
                 centroid, det = detection_centroids[col]
                 self.register(centroid, det.bbox, det.class_name, det.confidence)
 
@@ -468,26 +438,39 @@ class CentroidTracker:
 
 
 # ------------------------------
-# Class Names Loader
+# NMS helper — version-safe
 # ------------------------------
 
-class ClassNamesLoader:
-    def __init__(self, model_path: str):
-        model_path = Path(model_path)
-        self.classes_file = model_path.with_name("classes.txt")
-        if not self.classes_file.exists():
-            raise FileNotFoundError(f"classes.txt not found next to model: {self.classes_file}")
-        self.class_names = self.load_classes()
+def _apply_nms(
+    boxes_xywh: List[List[float]],
+    confs: List[float],
+    conf_thresh: float,
+    iou_thresh: float,
+) -> List[int]:
+    """
+    Wraps cv2.dnn.NMSBoxes and always returns a plain List[int].
 
-    def load_classes(self) -> List[str]:
-        with open(self.classes_file, "r", encoding="utf-8") as f:
-            classes = [line.strip() for line in f.readlines() if line.strip()]
-        if len(classes) == 0:
-            raise ValueError("classes.txt is empty")
-        return classes
+    OpenCV < 4.7  → nested list  [[i], [j], ...]  or flat list
+    OpenCV >= 4.7 → flat 1-D ndarray
+    """
+    if len(boxes_xywh) == 0:
+        return []
 
-    def get(self) -> List[str]:
-        return self.class_names
+    raw = cv2.dnn.NMSBoxes(boxes_xywh, confs, conf_thresh, iou_thresh)
+
+    if raw is None or (hasattr(raw, "__len__") and len(raw) == 0):
+        return []
+
+    if isinstance(raw, np.ndarray):
+        return raw.flatten().tolist()
+
+    indices = []
+    for item in raw:
+        if isinstance(item, (list, tuple, np.ndarray)):
+            indices.append(int(item[0]))
+        else:
+            indices.append(int(item))
+    return indices
 
 
 # ------------------------------
@@ -516,40 +499,185 @@ class UltralyticsModel:
 
 
 class ONNXModel:
+    """
+    YOLOv8 ONNX inference — matches the trail tester implementation exactly.
+
+    Standard ultralytics ONNX export output shape:
+        (1, num_attributes, num_anchors)   e.g.  (1, 9, 8400)
+                                                       ^
+                                                  4 box + 5 class scores
+
+    Trail tester equivalent:
+        preds = outputs[0][0].T      # (8400, 9)
+        for pred in preds:
+            class_scores = pred[4:]
+            class_id     = argmax(class_scores)
+            conf         = class_scores[class_id]
+            if conf < threshold: continue
+            cx, cy, w, h = pred[:4]
+            ...
+
+    The key insight from the debug log:
+        pred shape: (8400,) → the old code iterated over the WRONG axis.
+        outputs[0] is (9, 8400); iterating directly gave 9 rows of 8400 values.
+        After .T we get (8400, 9) — 8400 rows of 9 values — which is correct.
+    """
+
+    INPUT_SIZE = 640
+
     def __init__(self, model_path: str):
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
-        loader = ClassNamesLoader(model_path)
-        self.class_names = loader.get()
-        print(f"Loaded {len(self.class_names)} classes from classes.txt")
 
-    def infer(self, frame: np.ndarray, conf_thresh: float, iou_thresh: float):
-        start = time.time()
-        img = cv2.resize(frame, (640, 640))
+        # Log raw output shape — makes layout issues immediately visible
+        out_info = self.session.get_outputs()
+        self._output_shapes = [o.shape for o in out_info]
+        print(f"[ONNXModel] Output shapes: {self._output_shapes}")
+
+        # Hardcoded class list — no classes.txt dependency
+        self.class_names: List[str] = CLASS_NAMES
+        self.num_classes: int = len(self.class_names)
+        print(f"[ONNXModel] {self.num_classes} classes: {self.class_names}")
+        print(f"[ONNXModel] Providers: {self.session.get_providers()}")
+
+    # ------------------------------------------------------------------
+    # Preprocessing  (identical to trail tester)
+    # ------------------------------------------------------------------
+
+    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """
+        BGR frame → normalised NCHW float32 blob (1, 3, 640, 640)
+
+        Trail tester order:
+            img = cv2.resize(frame, (640, 640))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = img / 255.0
+            img = img.transpose(2, 0, 1)
+            img = np.expand_dims(img, axis=0)
+        """
+        img = cv2.resize(frame, (self.INPUT_SIZE, self.INPUT_SIZE))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.transpose(2, 0, 1).astype(np.float32) / 255.0
-        img = np.expand_dims(img, axis=0)
-        outputs = self.session.run(None, {self.input_name: img})
-        inference_time = (time.time() - start) * 1000
-        detections = []
-        preds = outputs[0][0]
+        img = img.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)        # HWC → CHW
+        img = np.expand_dims(img, axis=0)   # CHW → NCHW
+        return img
+
+    # ------------------------------------------------------------------
+    # Postprocessing  (identical to trail tester)
+    # ------------------------------------------------------------------
+
+    def _postprocess(
+        self,
+        raw_output: np.ndarray,
+        orig_h: int,
+        orig_w: int,
+        conf_thresh: float,
+        iou_thresh: float,
+    ) -> List[Detection]:
+        """
+        raw_output shape: (1, num_attrs, num_anchors)   e.g. (1, 9, 8400)
+
+        Step 1 — select batch 0 and transpose:
+            outputs[0][0]  →  (num_attrs, num_anchors)  e.g. (9, 8400)
+            .T             →  (num_anchors, num_attrs)  e.g. (8400, 9)
+
+        Each row (pred) is now: [cx, cy, w, h, score_c0, score_c1, ...]
+        Coords are in 640×640 model space; we scale back to original size.
+        """
+        # (1, num_attrs, num_anchors) → batch 0 → (num_attrs, num_anchors) → .T → (num_anchors, num_attrs)
+        preds = raw_output[0].T   # e.g. (8400, 9)
+
+        # Scale factors: model coords are in INPUT_SIZE space
+        sx = orig_w / self.INPUT_SIZE
+        sy = orig_h / self.INPUT_SIZE
+
+        boxes_xywh: List[List[float]] = []
+        boxes_xyxy: List[Tuple[int, int, int, int]] = []
+        confs:      List[float] = []
+        class_ids:  List[int]   = []
+
         for pred in preds:
-            obj_conf = pred[4]
-            if obj_conf < conf_thresh:
+            # pred: (num_attrs,)  e.g. (9,)
+            # cols 0-3  → cx, cy, w, h  (640×640 space)
+            # cols 4+   → per-class confidence scores (no separate objectness in YOLOv8)
+            class_scores = pred[4: 4 + self.num_classes]
+            class_id     = int(np.argmax(class_scores))
+            conf         = float(class_scores[class_id])
+
+            if conf < conf_thresh:
                 continue
-            class_scores = pred[5:]
-            class_id = int(np.argmax(class_scores))
-            class_conf = class_scores[class_id]
-            score = obj_conf * class_conf
-            if score < conf_thresh:
+
+            cx = float(pred[0])
+            cy = float(pred[1])
+            w  = float(pred[2])
+            h  = float(pred[3])
+
+            # Scale to original frame size
+            cx_s = cx * sx;  cy_s = cy * sy
+            w_s  = w  * sx;  h_s  = h  * sy
+
+            x1 = int(cx_s - w_s / 2)
+            y1 = int(cy_s - h_s / 2)
+            x2 = int(cx_s + w_s / 2)
+            y2 = int(cy_s + h_s / 2)
+
+            # Clamp to frame bounds
+            x1 = max(0, x1);  y1 = max(0, y1)
+            x2 = min(orig_w, x2);  y2 = min(orig_h, y2)
+
+            if x2 <= x1 or y2 <= y1:
                 continue
-            cx, cy, w, h = pred[:4]
-            x1 = int(cx - w / 2)
-            y1 = int(cy - h / 2)
-            x2 = int(cx + w / 2)
-            y2 = int(cy + h / 2)
-            detections.append(Detection((x1, y1, x2, y2), float(score), class_id, self.class_names[class_id]))
+
+            boxes_xywh.append([float(x1), float(y1), float(x2 - x1), float(y2 - y1)])
+            boxes_xyxy.append((x1, y1, x2, y2))
+            confs.append(conf)
+            class_ids.append(class_id)
+
+        if not boxes_xywh:
+            return []
+
+        survived = _apply_nms(boxes_xywh, confs, conf_thresh, iou_thresh)
+
+        detections: List[Detection] = []
+        for i in survived:
+            if i >= len(boxes_xyxy):
+                continue
+            cls_id = class_ids[i]
+            if cls_id >= self.num_classes:
+                continue
+            bx1, by1, bx2, by2 = boxes_xyxy[i]
+            detections.append(
+                Detection(
+                    bbox=(bx1, by1, bx2, by2),
+                    confidence=confs[i],
+                    class_id=cls_id,
+                    class_name=self.class_names[cls_id],
+                )
+            )
+
+        return detections
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def infer(
+        self,
+        frame: np.ndarray,
+        conf_thresh: float,
+        iou_thresh: float,
+    ) -> Tuple[List[Detection], float]:
+        orig_h, orig_w = frame.shape[:2]
+        blob = self._preprocess(frame)
+
+        t0 = time.time()
+        raw_outputs = self.session.run(None, {self.input_name: blob})
+        inference_time = (time.time() - t0) * 1000
+
+        detections = self._postprocess(
+            raw_outputs[0], orig_h, orig_w, conf_thresh, iou_thresh
+        )
         return detections, inference_time
 
 
@@ -631,11 +759,44 @@ latest_control_command: Dict[str, Any] = {
     "vacuum": False
 }
 
-capture_task: Optional[asyncio.Task] = None
-stop_capture_event = asyncio.Event()
 frame_queue: Queue = Queue(maxsize=1)
-
 rf_client = InferenceHTTPClient(api_url=ROBOFLOW_API_URL, api_key=ROBOFLOW_API_KEY)
+
+
+# ------------------------------
+# Camera helpers
+# ------------------------------
+
+def _build_capture(url: str) -> cv2.VideoCapture:
+    import os
+    is_rtsp = url.lower().startswith("rtsp://")
+    if is_rtsp:
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;{RTSP_TRANSPORT}|"
+            "fflags;nobuffer|"
+            "flags;low_delay|"
+            "analyzeduration;100000|"
+            "probesize;500000"
+        )
+    else:
+        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+    return cap
+
+
+def _encode_frame_jpeg(frame: np.ndarray) -> bytes:
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, FRAME_JPEG_QUALITY]
+    success, buf = cv2.imencode(".jpg", frame, encode_params)
+    return buf.tobytes() if success else b""
+
+
+def _frame_to_b64(frame: np.ndarray) -> str:
+    return f"data:image/jpeg;base64,{base64.b64encode(_encode_frame_jpeg(frame)).decode('ascii')}"
+
 
 # ------------------------------
 # WebSocket Manager
@@ -664,6 +825,7 @@ status_ws = WSManager()
 control_ws = WSManager()
 inference_ws = WSManager()
 
+
 # ------------------------------
 # Utility
 # ------------------------------
@@ -678,6 +840,7 @@ def require_test_mode():
     if system_state["mode"] != SystemMode.TEST:
         raise HTTPException(403, "System is not in TEST mode")
 
+
 # =========================================================
 # PIPELINE THREADS
 # =========================================================
@@ -685,36 +848,64 @@ def require_test_mode():
 def capture_loop():
     global pipeline_running, camera_connected
 
-    cap = cv2.VideoCapture(camera_url, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+    cap = _build_capture(camera_url)
     with camera_lock:
         camera_connected = cap.isOpened()
 
     if not cap.isOpened():
         print(f"[capture] ERROR: Cannot open camera {camera_url}")
+        if main_event_loop:
+            asyncio.run_coroutine_threadsafe(
+                inference_ws.broadcast({"type": "camera_status", "connected": False}),
+                main_event_loop
+            )
         return
 
-    print("[capture] Camera opened OK")
+    print(f"[capture] Camera opened: {camera_url}")
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            inference_ws.broadcast({"type": "camera_status", "connected": True}),
+            main_event_loop
+        )
+
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 30
 
     while pipeline_running:
         ret, frame = cap.read()
 
         if not ret:
+            consecutive_failures += 1
             with camera_lock:
                 camera_connected = False
-            time.sleep(0.05)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print("[capture] Too many failures, reconnecting...")
+                cap.release()
+                time.sleep(1.0)
+                cap = _build_capture(camera_url)
+                consecutive_failures = 0
+                with camera_lock:
+                    camera_connected = cap.isOpened()
+            else:
+                time.sleep(0.05)
             continue
 
+        consecutive_failures = 0
         with camera_lock:
             camera_connected = True
+
+        if frame.shape[1] != VIDEO_WIDTH or frame.shape[0] != VIDEO_HEIGHT:
+            frame = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
+
+        global latest_raw_frame
+        with latest_frame_lock:
+            latest_raw_frame = frame.copy()
 
         if capture_queue.full():
             try:
                 capture_queue.get_nowait()
             except Exception:
                 pass
-
         capture_queue.put(frame)
 
     cap.release()
@@ -724,7 +915,7 @@ def capture_loop():
 
 
 def inference_loop_thread():
-    global pipeline_running
+    global pipeline_running, _frame_send_counter
     last_cloud_time = 0
 
     while pipeline_running:
@@ -739,6 +930,11 @@ def inference_loop_thread():
             "mode": current_mode.value,
         }
 
+        _frame_send_counter += 1
+        if _frame_send_counter > FRAME_SEND_INTERVAL:
+            _frame_send_counter = 0
+            message["frame"] = _frame_to_b64(frame)
+
         # ---- LOCAL ----
         if current_mode == InferenceMode.LOCAL and local_model:
             try:
@@ -746,7 +942,6 @@ def inference_loop_thread():
                     frame, conf_threshold, iou_threshold
                 )
 
-                # Count detections for stats
                 if detections:
                     stats_accumulator.record_detection(len(detections))
 
@@ -763,7 +958,6 @@ def inference_loop_thread():
                 message["inference_time_ms"] = inference_time
                 message["zone_events"] = zone_events
 
-                # Post zone events to DB via event loop (fire-and-forget, non-blocking)
                 if zone_events and main_event_loop is not None:
                     for ev in zone_events:
                         asyncio.run_coroutine_threadsafe(
@@ -772,7 +966,9 @@ def inference_loop_thread():
                         )
 
             except Exception as e:
+                import traceback
                 print(f"[inference] Local model error: {e}")
+                print(traceback.format_exc())
                 stats_accumulator.record_failure()
                 continue
 
@@ -803,8 +999,9 @@ def inference_loop_thread():
                     stats_accumulator.record_failure()
                     continue
             else:
-                continue
-
+                message["type"] = "frame_only"
+                message["zone_events"] = []
+                message["objects"] = []
         else:
             continue
 
@@ -856,17 +1053,14 @@ async def start_pipeline():
             raise HTTPException(500, f"Model load failed: {e}")
 
     zone_trigger_manager.reset()
-
     pipeline_running = True
 
     capture_thread = threading.Thread(target=capture_loop, daemon=True)
     inference_thread = threading.Thread(target=inference_loop_thread, daemon=True)
-
     capture_thread.start()
     inference_thread.start()
 
     asyncio.create_task(broadcast_loop())
-
     return {"status": "started"}
 
 
@@ -885,6 +1079,35 @@ async def stop_pipeline():
         inference_thread.join(timeout=2.0)
 
     return {"status": "stopped"}
+
+
+# =========================================================
+# MJPEG SNAPSHOT / STREAM ENDPOINTS
+# =========================================================
+
+from fastapi.responses import Response, StreamingResponse
+
+@app.get("/camera/snapshot")
+async def camera_snapshot():
+    with latest_frame_lock:
+        frame = latest_raw_frame
+    if frame is None:
+        raise HTTPException(503, "No frame available — is the pipeline running?")
+    return Response(content=_encode_frame_jpeg(frame), media_type="image/jpeg")
+
+
+@app.get("/camera/mjpeg")
+async def camera_mjpeg():
+    async def _generator():
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        while pipeline_running:
+            with latest_frame_lock:
+                frame = latest_raw_frame
+            if frame is not None:
+                yield boundary + _encode_frame_jpeg(frame) + b"\r\n"
+            await asyncio.sleep(0.04)
+
+    return StreamingResponse(_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 # =========================================================
@@ -909,6 +1132,7 @@ async def reset_zones():
 async def set_camera(url: str):
     global camera_url
     camera_url = url
+    print(f"[camera] URL updated to: {url}")
     return {"status": "ok", "camera_url": camera_url}
 
 @app.get("/inference/get_camera")
@@ -978,6 +1202,26 @@ async def set_cloud_interval(seconds: int):
     CLOUD_INFERENCE_INTERVAL = seconds
     return {"interval": CLOUD_INFERENCE_INTERVAL}
 
+@app.post("/inference/set_rtsp_transport")
+async def set_rtsp_transport(transport: str):
+    global RTSP_TRANSPORT
+    if transport not in ("tcp", "udp"):
+        raise HTTPException(400, "transport must be 'tcp' or 'udp'")
+    RTSP_TRANSPORT = transport
+    was_running = pipeline_running
+    if was_running:
+        await stop_pipeline()
+        await start_pipeline()
+    return {"rtsp_transport": RTSP_TRANSPORT, "restarted": was_running}
+
+@app.post("/inference/set_frame_quality")
+async def set_frame_quality(quality: int):
+    global FRAME_JPEG_QUALITY
+    if not 1 <= quality <= 95:
+        raise HTTPException(400, "quality must be between 1 and 95")
+    FRAME_JPEG_QUALITY = quality
+    return {"frame_jpeg_quality": FRAME_JPEG_QUALITY}
+
 
 # =========================================================
 # REPORTS ENDPOINTS
@@ -985,16 +1229,11 @@ async def set_cloud_interval(seconds: int):
 
 @app.get("/reports")
 async def get_reports():
-    """
-    Returns the latest system_stats row plus live in-memory counters merged together.
-    The in-memory counters are always more current than the DB snapshot.
-    """
     snap = stats_accumulator.snapshot()
     total = snap["total_processed"]
     failures = snap["total_failures"]
     online = len([d for d, t in devices.items() if utc_now() - t < HEARTBEAT_TIMEOUT])
     accuracy = ((total - failures) / total * 100) if total > 0 else 0.0
-
     return {
         "total_items_processed": total,
         "failed_inferences": failures,
@@ -1004,7 +1243,6 @@ async def get_reports():
 
 @app.get("/reports/history")
 async def get_reports_history(limit: int = 50):
-    """Returns the last N system_stats snapshots for trend graphs."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -1034,14 +1272,11 @@ async def get_failed_inferences(limit: int = 100, reviewed: Optional[int] = None
         rows = await cursor.fetchall()
     return {"items": [dict(r) for r in rows]}
 
-
 @app.patch("/failed-inferences/{item_id}/review")
 async def review_failed_inference(item_id: int, assigned_category: str, notes: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """UPDATE failed_inferences
-               SET assigned_category=?, reviewed=1, notes=?
-               WHERE id=?""",
+            "UPDATE failed_inferences SET assigned_category=?, reviewed=1, notes=? WHERE id=?",
             (assigned_category, notes, item_id)
         )
         await db.commit()
@@ -1050,10 +1285,8 @@ async def review_failed_inference(item_id: int, assigned_category: str, notes: s
         raise HTTPException(404, "Item not found")
     return {"status": "reviewed", "id": item_id, "assigned_category": assigned_category}
 
-
 @app.post("/failed-inferences/{item_id}/retry")
 async def retry_failed_inference(item_id: int):
-    """Reset a reviewed item back to unreviewed so it can be re-labelled."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE failed_inferences SET reviewed=0, assigned_category=NULL WHERE id=?",
@@ -1068,44 +1301,29 @@ async def retry_failed_inference(item_id: int):
 # =========================================================
 
 class ClearLevel(str, Enum):
-    STATS_ONLY = "stats_only"          # Clear system_stats history only
-    FAILED_ONLY = "failed_only"        # Clear failed_inferences only
-    LOGS_ONLY = "logs_only"            # Clear inference_logs only
-    ALL = "all"                        # Nuclear — clears everything
-
+    STATS_ONLY  = "stats_only"
+    FAILED_ONLY = "failed_only"
+    LOGS_ONLY   = "logs_only"
+    ALL         = "all"
 
 @app.delete("/database/clear")
 async def clear_database(level: ClearLevel, confirm: str = ""):
-    """
-    Clear database records at the specified level.
-    Requires confirm="CONFIRM" to prevent accidental wipes.
-    """
     if confirm != "CONFIRM":
-        raise HTTPException(
-            400,
-            "Pass confirm=CONFIRM in query params to proceed. This action is irreversible."
-        )
-
+        raise HTTPException(400, "Pass confirm=CONFIRM in query params to proceed. This action is irreversible.")
     cleared = []
     async with aiosqlite.connect(DB_PATH) as db:
         if level in (ClearLevel.STATS_ONLY, ClearLevel.ALL):
             await db.execute("DELETE FROM system_stats")
             cleared.append("system_stats")
-
         if level in (ClearLevel.FAILED_ONLY, ClearLevel.ALL):
             await db.execute("DELETE FROM failed_inferences")
             cleared.append("failed_inferences")
-
         if level in (ClearLevel.LOGS_ONLY, ClearLevel.ALL):
             await db.execute("DELETE FROM inference_logs")
             cleared.append("inference_logs")
-
         await db.commit()
-
-    # If clearing all, also reset in-memory counters
     if level == ClearLevel.ALL:
         stats_accumulator.__init__()
-
     print(f"[db] Cleared tables: {cleared}")
     return {"status": "cleared", "tables": cleared}
 
@@ -1138,7 +1356,10 @@ async def websocket_control(ws: WebSocket):
 @app.websocket("/ws/inference")
 async def websocket_inference(ws: WebSocket):
     await inference_ws.connect(ws)
+    with camera_lock:
+        connected = camera_connected
     await ws.send_json({"type": "zone_config", "zones": TRIGGER_ZONES})
+    await ws.send_json({"type": "camera_status", "connected": connected})
     try:
         while True:
             await ws.receive_text()
@@ -1154,8 +1375,8 @@ def apply_control_command(cmd: Dict[str, Any]):
     arm = cmd.get("arm", {})
     latest_control_command.update({
         "arm": {
-            "azimuth": clamp(arm.get("azimuth", 0.0), -1.0, 1.0),
-            "elevation": clamp(arm.get("elevation", 0.0), -1.0, 1.0),
+            "azimuth":   clamp(arm.get("azimuth",   0.0), -1.0, 1.0),
+            "elevation": clamp(arm.get("elevation",  0.0), -1.0, 1.0),
         },
         "conveyor": clamp(cmd.get("conveyor", 0.0), -1.0, 1.0),
         "vacuum": bool(cmd.get("vacuum", False))
@@ -1202,16 +1423,9 @@ async def test_control(cmd: Dict[str, Any]):
 
 @app.get("/test/control")
 async def get_test_control():
-    # DEADMAN: if no recent control, return safe state
     last = system_state.get("last_control")
-
     if last and utc_now() - last > CONTROL_DEADMAN_TIMEOUT:
-        return {
-            "arm": {"azimuth": 0.0, "elevation": 0.0},
-            "conveyor": 0.0,
-            "vacuum": False
-        }
-
+        return {"arm": {"azimuth": 0.0, "elevation": 0.0}, "conveyor": 0.0, "vacuum": False}
     return latest_control_command
 
 
@@ -1234,10 +1448,8 @@ async def capture_image(device_id: str, file: UploadFile = File(...)):
     devices[device_id] = utc_now()
     file_id = f"{uuid.uuid4()}.jpg"
     file_path = UPLOAD_DIR / file_id
-
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
-
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -1281,7 +1493,6 @@ async def control_deadman_watchdog():
         await asyncio.sleep(0.05)
 
 async def stats_flush_task():
-    """Periodically write in-memory stats to DB. Runs every STATS_FLUSH_INTERVAL seconds."""
     while True:
         await asyncio.sleep(STATS_FLUSH_INTERVAL)
         try:
@@ -1305,3 +1516,6 @@ async def startup_event():
     asyncio.create_task(stats_flush_task())
 
     print("[startup] EcoSort backend ready")
+    print(f"[startup] Default camera: {DEFAULT_CAMERA_URL}")
+    print(f"[startup] MJPEG stream: http://localhost:8000/camera/mjpeg")
+    print(f"[startup] Classes ({len(CLASS_NAMES)}): {CLASS_NAMES}")
