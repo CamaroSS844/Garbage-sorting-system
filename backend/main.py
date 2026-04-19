@@ -76,7 +76,7 @@ DEFAULT_CAPTURE_SOURCE: str = "http"   # "http" | "rtsp"
 LOCAL_INFERENCE_FPS     = 10
 CLOUD_INFERENCE_INTERVAL = 30
 
-LOCAL_MODEL_PATH = r"C:\Users\Taboka\Documents\others\personal final project\withOnnx\latest.onnx"
+LOCAL_MODEL_PATH = r"C:\Users\Taboka\Documents\others\personal final project\my_model2\my_model.onnx"
 LOCAL_MODEL_TYPE = "onnx"
 
 CONF_THRESHOLD = 0.5

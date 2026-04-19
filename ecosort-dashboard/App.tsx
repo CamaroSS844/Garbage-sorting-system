@@ -8,6 +8,7 @@ import SystemReports from './components/SystemReports';
 import SystemTestMode from './components/SystemtestMode';
 import ActuatorStatusPanel from './components/ActuatorStatusPanel';
 import SystemSettingsPanel from './components/SystemSettingsPanel';
+import './src/index.css';
 
 enum Page {
   FEED = 'feed',
@@ -71,7 +72,7 @@ const App: React.FC = () => {
           <div className="bg-emerald-500 p-2 rounded-lg">
             <Trash2 className="w-6 h-6 text-white" />
           </div>
-          <span className="text-xl font-bold tracking-tight">EcoSort AI</span>
+          <span className="text-xl font-bold tracking-tight">AI sorting system</span>
         </div>
 
         <nav className="mt-6 px-4 space-y-2">
